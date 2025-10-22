@@ -18,6 +18,10 @@ type Config struct {
 	HTTP string `json:"http"`
 	// TCP address to serve RPC for fuzzer processes (optional).
 	RPC string `json:"rpc,omitempty"`
+	// TCP address of the RL (Reinforcement Learning) RPC server (optional).
+	// If specified, syz-manager will connect to this server for RL-based fuzzing guidance.
+	// Example: "127.0.0.1:9999"
+	RLServer string `json:"rl_server,omitempty"`
 	// Location of a working directory for the syz-manager process. Outputs here include:
 	// - <workdir>/crashes/*: crash output files
 	// - <workdir>/corpus.db: corpus with interesting programs

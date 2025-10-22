@@ -111,6 +111,9 @@ type Manager struct {
 
 	reproLoop *manager.ReproLoop
 
+	// RL integration
+	rlManager *RLManager
+
 	Stats
 }
 
@@ -323,6 +326,17 @@ func RunManager(mode *Mode, cfg *mgrconfig.Config) {
 	if err := mgr.serv.Listen(); err != nil {
 		log.Fatalf("failed to start rpc server: %v", err)
 	}
+
+	// Initialize RL manager
+	mgr.rlManager = NewRLManager(cfg.RLServer)
+	if mgr.rlManager.IsEnabled() {
+		if err := mgr.rlManager.TestConnection(); err != nil {
+			log.Logf(0, "RL connection test failed: %v", err)
+		} else {
+			log.Logf(0, "RL integration enabled and connected")
+		}
+	}
+
 	ctx := vm.ShutdownCtx()
 	go func() {
 		err := mgr.serv.Serve(ctx)

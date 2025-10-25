@@ -49,6 +49,9 @@ import (
 	"github.com/google/syzkaller/sys/targets"
 	"github.com/google/syzkaller/vm"
 	"github.com/google/syzkaller/vm/dispatcher"
+
+
+    "github.com/ybbus/jsonrpc/v3"
 )
 
 var (
@@ -111,8 +114,9 @@ type Manager struct {
 
 	reproLoop *manager.ReproLoop
 
-	// RL integration
-	rlManager *RLManager
+	rlClient    jsonrpc.RPCClient
+    rlClientMux sync.Mutex
+
 
 	Stats
 }
@@ -188,6 +192,17 @@ var (
 		ModeIfaceProbe,
 	}
 )
+
+
+func (mgr *Manager) initRL() {
+    mgr.rlClient = jsonrpc.NewClient("http://localhost:5000")
+    log.Logf(0, "RL client initialized")
+}
+
+
+func (mgr *Manager) createRLSession(prog *prog.Prog) (*RLSession, error) {
+    return NewRLSession(&mgr.rlClient, &mgr.rlClientMux, prog)
+}
 
 func modesDescription() string {
 	desc := "mode of operation, one of:\n"
@@ -327,15 +342,7 @@ func RunManager(mode *Mode, cfg *mgrconfig.Config) {
 		log.Fatalf("failed to start rpc server: %v", err)
 	}
 
-	// Initialize RL manager
-	mgr.rlManager = NewRLManager(cfg.RLServer)
-	if mgr.rlManager.IsEnabled() {
-		if err := mgr.rlManager.TestConnection(); err != nil {
-			log.Logf(0, "RL connection test failed: %v", err)
-		} else {
-			log.Logf(0, "RL integration enabled and connected")
-		}
-	}
+	mgr.initRL()
 
 	ctx := vm.ShutdownCtx()
 	go func() {

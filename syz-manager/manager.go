@@ -50,8 +50,7 @@ import (
 	"github.com/google/syzkaller/vm"
 	"github.com/google/syzkaller/vm/dispatcher"
 
-
-    "github.com/ybbus/jsonrpc/v3"
+	"github.com/ybbus/jsonrpc/v3"
 )
 
 var (
@@ -115,8 +114,7 @@ type Manager struct {
 	reproLoop *manager.ReproLoop
 
 	rlClient    jsonrpc.RPCClient
-    rlClientMux sync.Mutex
-
+	rlClientMux sync.Mutex
 
 	Stats
 }
@@ -193,15 +191,9 @@ var (
 	}
 )
 
-
 func (mgr *Manager) initRL() {
-    mgr.rlClient = jsonrpc.NewClient("http://localhost:5000")
-    log.Logf(0, "RL client initialized")
-}
-
-
-func (mgr *Manager) createRLSession(prog *prog.Prog) (*RLSession, error) {
-    return NewRLSession(&mgr.rlClient, &mgr.rlClientMux, prog)
+	mgr.rlClient = jsonrpc.NewClient("http://localhost:5000")
+	log.Logf(0, "RL client initialized")
 }
 
 func modesDescription() string {

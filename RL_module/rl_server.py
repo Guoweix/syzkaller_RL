@@ -2,8 +2,10 @@
 import logging
 import asyncio
 from datetime import datetime
-from typing import Dict
+from typing import Dict, Optional
 from jsonrpcserver import method, serve, Result, Success, Error
+import random
+from collections import OrderedDict
 
 class RL_Session:
     """Class representing a Reinforcement Learning session"""
@@ -12,6 +14,7 @@ class RL_Session:
         self.session_id = session_id
         self.start_time = datetime.now()
         self.last_active = self.start_time
+        self.access_count = 0  # 访问计数
         self.status = "active"
         
         # Setup logging
@@ -19,9 +22,10 @@ class RL_Session:
         self.logger.info(f"Session {session_id} created.")
 
     def update_activity(self):
-        """Update the last active timestamp"""
+        """Update the last active timestamp and increment access count"""
         self.last_active = datetime.now()
-        self.logger.info(f"Session {self.session_id} activity updated.")
+        self.access_count += 1
+        self.logger.info(f"Session {self.session_id} activity updated. Access count: {self.access_count}")
     
     def end_session(self):
         """End the session"""
@@ -29,8 +33,68 @@ class RL_Session:
         self.logger.info(f"Session {self.session_id} ended.")
 
 
-# Global session storage
-sessions: Dict[str, RL_Session] = {}
+class LRUSessionManager:
+    """LRU Session Manager with maximum capacity"""
+    
+    def __init__(self, max_capacity: int = 1000):
+        self.max_capacity = max_capacity
+        self.sessions = OrderedDict()  # 使用OrderedDict维护访问顺序
+        self.logger = logging.getLogger("LRUSessionManager")
+        
+    def get_session(self, session_id: str) -> Optional[RL_Session]:
+        """获取session，同时更新访问顺序"""
+        if session_id in self.sessions:
+            # 移动到最后（最近访问）
+            session = self.sessions.pop(session_id)
+            self.sessions[session_id] = session
+            session.update_activity()
+            return session
+        return None
+    
+    def add_session(self, session_id: str) -> RL_Session:
+        """添加新session，如果超过容量则删除最少访问的"""
+        # 如果已存在，直接返回
+        if session_id in self.sessions:
+            return self.get_session(session_id)
+        
+        # 检查是否需要删除最少使用的session
+        if len(self.sessions) >= self.max_capacity:
+            # 删除最老的（最少访问的）session
+            oldest_id, oldest_session = self.sessions.popitem(last=False)
+            oldest_session.end_session()
+            self.logger.info(f"Removed LRU session {oldest_id} due to capacity limit ({self.max_capacity})")
+        
+        # 添加新session
+        new_session = RL_Session(session_id)
+        self.sessions[session_id] = new_session
+        self.logger.info(f"Added new session {session_id}. Total sessions: {len(self.sessions)}")
+        return new_session
+    
+    def remove_session(self, session_id: str) -> bool:
+        """删除指定session"""
+        if session_id in self.sessions:
+            session = self.sessions.pop(session_id)
+            session.end_session()
+            self.logger.info(f"Removed session {session_id}. Total sessions: {len(self.sessions)}")
+            return True
+        return False
+    
+    def session_exists(self, session_id: str) -> bool:
+        """检查session是否存在"""
+        return session_id in self.sessions
+    
+    def get_stats(self) -> Dict:
+        """获取统计信息"""
+        return {
+            "total_sessions": len(self.sessions),
+            "max_capacity": self.max_capacity,
+            "capacity_usage": f"{len(self.sessions)}/{self.max_capacity}",
+            "usage_percentage": round((len(self.sessions) / self.max_capacity) * 100, 2)
+        }
+
+
+# Global session manager with LRU capability
+session_manager = LRUSessionManager(max_capacity=1000)  # 最大1000个session
 
 # Setup logging
 logging.basicConfig(
@@ -53,59 +117,41 @@ def ping() -> Result:
 @method
 def init_session(session_id: str) -> Result:
     """Initialize a new RL session"""
-    global sessions
+    global session_manager
     
     if not session_id:
         logger.warning("Empty session_id provided")
         return Error(-32602, "Invalid params: session_id is required")
     
-    if session_id in sessions:
+    if session_manager.session_exists(session_id):
         logger.warning(f"Session {session_id} already exists")
         return Error(-32603, f"Session {session_id} already exists")
     
-    sessions[session_id] = RL_Session(session_id)
-    logger.info(f"Session {session_id} initialized")
+    session_manager.add_session(session_id)
+    stats = session_manager.get_stats()
+    logger.info(f"Session {session_id} initialized. Stats: {stats}")
     return Success({
         "success": True,
         "message": f"Session {session_id} initialized successfully",
-        "session_id": session_id
+        "session_id": session_id,
+        "stats": stats
     })
 
-
-@method
-def end_session(session_id: str) -> Result:
-    """End an existing RL session"""
-    global sessions
-    
-    if not session_id:
-        logger.warning("Empty session_id provided")
-        return Error(-32602, "Invalid params: session_id is required")
-    
-    if session_id not in sessions:
-        logger.warning(f"Session {session_id} does not exist")
-        return Error(-32603, f"Session {session_id} does not exist")
-    
-    sessions[session_id].end_session()
-    del sessions[session_id]
-    logger.info(f"Session {session_id} ended")
-    return Success({
-        "success": True,
-        "message": f"Session {session_id} ended successfully",
-        "session_id": session_id
-    })
 
 @method
 def get_action(session_id: str, state: Dict) -> Result:
     """Get action from the RL agent based on the current state"""
-    global sessions
+    global session_manager
     
     if not session_id:
         logger.warning("Empty session_id provided")
         return Error(-32602, "Invalid params: session_id is required")
     
-    if session_id not in sessions:
-        logger.warning(f"Session {session_id} does not exist")
-        return Error(-32603, f"Session {session_id} does not exist")
+    # 获取或创建session
+    session = session_manager.get_session(session_id)
+    if session is None:
+        session = session_manager.add_session(session_id)
+        logger.info(f"Auto-created session {session_id}")
     
     # 将Go客户端传来的state转换成Python可用的结构体
     try:
@@ -128,9 +174,25 @@ def get_action(session_id: str, state: Dict) -> Result:
         return Error(-32602, f"Invalid state format: {e}")
     
     # 基于转换后的状态生成动作
-    action = {"session_id": session_id, "action_type": 0, "action_param": 1}
+
+    # action = {"session_id": session_id, "action_type": 0, "action_param": 1}
+    x=random.random()
+
+    if x<0.10:
+          action = {"session_id": session_id, "action_type": 0, "action_param": 0}
+    elif x<0.20:
+            action = {"session_id": session_id, "action_type": 0, "action_param": 1}
+    elif x<0.30:
+            action = {"session_id": session_id, "action_type": 0, "action_param": 2}
+    elif x<0.40:
+            action = {"session_id": session_id, "action_type": 1, "action_param": 0}
+    elif x<0.50:
+            action = {"session_id": session_id, "action_type": 1, "action_param": 1}
+    else:   
+            action = {"session_id": session_id, "action_type": -1, "action_param": 2}
     
-    sessions[session_id].update_activity()
+    
+    # session activity 已经在get_session中更新了
     logger.info(f"Action provided for session {session_id}")
     return Success({
         "action": action,
@@ -141,25 +203,35 @@ def get_action(session_id: str, state: Dict) -> Result:
 @method
 def submit_reward(session_id: str, reward: float) -> Result:
     """Submit reward to the RL agent"""
-    global sessions
+    global session_manager
     
     if not session_id:
         logger.warning("Empty session_id provided")
         return Error(-32602, "Invalid params: session_id is required")
     
-    if session_id not in sessions:
+    session = session_manager.get_session(session_id)
+    if session is None:
         logger.warning(f"Session {session_id} does not exist")
         return Error(-32603, f"Session {session_id} does not exist")
     
     # Placeholder for reward processing logic
     logger.info(f"Reward {reward} submitted for session {session_id}")
     
-    sessions[session_id].update_activity()
     return Success({
         "success": True,
         "message": f"Reward {reward} submitted successfully",
         "session_id": session_id
     })
+
+
+@method
+def get_session_stats() -> Result:
+    """Get session manager statistics"""
+    global session_manager
+    
+    stats = session_manager.get_stats()
+    logger.info(f"Session stats requested: {stats}")
+    return Success(stats)
 
     
 

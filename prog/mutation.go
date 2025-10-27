@@ -10,11 +10,103 @@ import (
 	"math/rand"
 	"sort"
 
+	"github.com/google/syzkaller/pkg/hash"
 	"github.com/google/syzkaller/pkg/image"
 )
 
 // Maximum length of generated binary blobs inserted into the program.
 const maxBlobLen = uint64(100 << 10)
+
+// RL Action types
+type ActionType int
+
+const (
+	ActionMutate    ActionType = 0
+	ActionMerge     ActionType = 1
+	ActionInsert    ActionType = 2
+	ActionDelete    ActionType = 3
+	ActionNormalize ActionType = 4
+	Error           ActionType = 5
+)
+
+type Action struct {
+	SessionID   string     `json:"session_id"`
+	ActionType  ActionType `json:"action_type"`
+	ActionParam int        `json:"action_param"`
+}
+
+type ActionState struct {
+	SessionID    string `json:"session_id"`
+	CallSequence []int  `json:"call_sequence"`
+	CallCount    int    `json:"call_count"`
+	ExecTime     uint64 `json:"exec_time"`
+	ErrorCount   int    `json:"error_count"`
+}
+
+// RLClient interface for RL communication
+type RLClient interface {
+	GetAction(sessionID string, state *ActionState) (*Action, error)
+	ChangeSessionID(oldSessionID, newSessionID string) error
+}
+
+// Global RL client (will be set by manager)
+var globalRLClient RLClient
+
+// SetRLClient sets the global RL client (to be called by manager)
+func SetRLClient(client RLClient) {
+	globalRLClient = client
+}
+
+// SubmitRLReward submits reward to the global RL client
+func SubmitRLReward(sessionID string, reward float64) error {
+	if globalRLClient == nil {
+		return nil // No RL client available
+	}
+	// We need to extend RLClient interface to include SubmitReward
+	if rlSubmitter, ok := globalRLClient.(interface {
+		SubmitReward(sessionID string, reward float64) error
+	}); ok {
+		return rlSubmitter.SubmitReward(sessionID, reward)
+	}
+	return nil // Client doesn't support reward submission
+}
+
+// buildActionState creates ActionState from program
+func buildActionState(p *Prog, execTime uint64, errorCount int) *ActionState {
+	sig := hash.String(p.Serialize())
+	callSequence := make([]int, len(p.Calls))
+
+	for i, call := range p.Calls {
+		callSequence[i] = call.Meta.ID
+	}
+
+	return &ActionState{
+		SessionID:    sig,
+		CallSequence: callSequence,
+		CallCount:    len(p.Calls),
+		ExecTime:     execTime,
+		ErrorCount:   errorCount,
+	}
+}
+
+// applyRLAction applies RL action to the program
+func applyRLAction(ctx *mutator, action *Action) bool {
+
+	switch action.ActionType {
+	case ActionMutate:
+		return ctx.mutateArg()
+	case ActionInsert:
+		return ctx.insertCall()
+	case ActionDelete:
+		return ctx.removeCall()
+	case ActionMerge:
+		return ctx.splice()
+	case ActionNormalize:
+		return ctx.squashAny()
+	default:
+		return true // Unknown action type, skip mutation
+	}
+}
 
 // Mutate program p.
 //
@@ -70,7 +162,29 @@ func (p *Prog) MutateWithOpts(rs rand.Source, ncalls int, ct *ChoiceTable, noMut
 		corpus:   corpus,
 		opts:     opts,
 	}
+
+	// Create RL session ID from program content
+	sessionID := hash.String(p.Serialize())
+
 	for stop, ok := false, false; !stop; stop = ok && len(p.Calls) != 0 && r.oneOf(opts.ExpectedIterations) {
+
+		// 尝试通过RL获取action
+		if globalRLClient != nil {
+
+			state := buildActionState(p, 0, 0)
+			rlAction, err := globalRLClient.GetAction(sessionID, state)
+
+			if err == nil && rlAction != nil {
+				fmt.Println("RL_Action ", rlAction.ActionType)
+				// 根据RL action执行对应的变异操作
+				ok = applyRLAction(ctx, rlAction)
+				if ok {
+					continue
+				}
+			}
+		}
+		ok = false
+		// Fall back to random mutation if RL action failed or unavailable
 		val := r.Intn(totalWeight)
 		val -= opts.SquashWeight
 		if val < 0 {
@@ -98,6 +212,13 @@ func (p *Prog) MutateWithOpts(rs rand.Source, ncalls int, ct *ChoiceTable, noMut
 	}
 	p.sanitizeFix()
 	p.debugValidate()
+
+	// Update session ID after mutation if program changed
+	newSessionID := hash.String(p.Serialize())
+	if globalRLClient != nil && newSessionID != sessionID {
+		globalRLClient.ChangeSessionID(sessionID, newSessionID)
+	}
+
 	if got := len(p.Calls); got < 1 || got > ncalls {
 		panic(fmt.Sprintf("bad number of calls after mutation: %v, want [1, %v]", got, ncalls))
 	}

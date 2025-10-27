@@ -113,6 +113,19 @@ func SubmitReward(client *jsonrpc.RPCClient, clientMux *sync.Mutex, sessionID st
 	})
 }
 
+func ChangeSessionID(client *jsonrpc.RPCClient, clientMux *sync.Mutex, oldSessionID string, newSessionID string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	clientMux.Lock()
+	defer clientMux.Unlock()
+	var result map[string]interface{}
+	return (*client).CallFor(ctx, &result, "change_session_id", map[string]interface{}{
+		"old_session_id": oldSessionID,
+		"new_session_id": newSessionID,
+	})
+}
+
 func BuildActionState(p *prog.Prog, execTime uint64, errorCount int) *ActionState {
 	sig := hash.String(p.Serialize())
 	callSequence := make([]int, len(p.Calls))

@@ -552,6 +552,7 @@ func (serv *server) CreateInstance(id int, injectExec chan<- bool, updInfo dispa
 		// Executor may report proc IDs that are larger than serv.cfg.Procs.
 		lastExec: MakeLastExecuting(prog.MaxPids, 6),
 		stats:    serv.runnerStats,
+		mgr:      serv.mgr,
 		procs:    serv.cfg.Procs,
 		updInfo:  updInfo,
 		resultCh: make(chan error, 1),

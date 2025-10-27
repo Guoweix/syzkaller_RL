@@ -15,6 +15,7 @@ import (
 	"github.com/google/syzkaller/pkg/cover"
 	"github.com/google/syzkaller/pkg/flatrpc"
 	"github.com/google/syzkaller/pkg/fuzzer/queue"
+	"github.com/google/syzkaller/pkg/hash"
 	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/pkg/report"
@@ -46,6 +47,7 @@ type Runner struct {
 	lastExec      *LastExecuting
 	updInfo       dispatcher.UpdateInfo
 	resultCh      chan error
+	mgr           Manager
 
 	// The mutex protects all the fields below.
 	mu          sync.Mutex
@@ -449,6 +451,20 @@ func (runner *Runner) handleExecResult(msg *flatrpc.ExecResult) error {
 		}
 		runner.hanged[msg.Id] = true
 	}
+	// Submit RL reward based on execution result
+	if req.Type == flatrpc.RequestTypeProgram && msg.Info != nil {
+		reward := calculateRLReward(status, msg.Info)
+		if reward > 0 {
+			sessionID := calculateSessionID(req.Prog)
+			// Use global RL reward submission function
+			if err := prog.SubmitRLReward(sessionID, reward); err != nil {
+				fmt.Printf("F_")
+			} else {
+				fmt.Printf("Submitted RL reward %.2f for session %s\n", reward, sessionID)
+			}
+		}
+	}
+
 	req.Done(&queue.Result{
 		Executor: queue.ExecutorID{
 			VM:   runner.id,
@@ -627,4 +643,46 @@ func addFallbackSignal(p *prog.Prog, info *flatrpc.ProgInfo) {
 	for i, inf := range callInfos {
 		info.Calls[i].Signal = inf.Signal
 	}
+}
+
+// calculateSessionID generates session ID from program content
+func calculateSessionID(p *prog.Prog) string {
+	return hash.String(p.Serialize())
+}
+
+// calculateRLReward calculates reward based on execution result
+func calculateRLReward(status queue.Status, info *flatrpc.ProgInfo) float64 {
+	if info == nil {
+		return 0.0
+	}
+
+	baseReward := 0.0
+	switch status {
+	case queue.Success:
+		baseReward = 0.5 // Base reward for successful execution
+	case queue.ExecFailure:
+		baseReward = 0.1 // Small reward for execution attempt
+	case queue.Hanged:
+		baseReward = 0.0 // No reward for hanged execution
+	default:
+		baseReward = 0.0
+	}
+
+	// Bonus for coverage and signal
+	if info.Extra != nil {
+		coverageBonus := float64(len(info.Extra.Cover)) / 1000.0
+		signalBonus := float64(len(info.Extra.Signal)) / 1000.0
+		baseReward += coverageBonus + signalBonus
+	}
+
+	// Bonus for successful calls
+	successfulCalls := 0
+	for _, call := range info.Calls {
+		if call.Error == 0 {
+			successfulCalls++
+		}
+	}
+	callBonus := float64(successfulCalls) / float64(len(info.Calls)) * 0.3
+
+	return baseReward + callBonus
 }

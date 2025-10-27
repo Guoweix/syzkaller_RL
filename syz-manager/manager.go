@@ -191,9 +191,57 @@ var (
 	}
 )
 
+// RLClientImpl implements the prog.RLClient interface
+type RLClientImpl struct {
+	client *jsonrpc.RPCClient
+	mutex  *sync.Mutex
+}
+
+// GetAction implements the prog.RLClient interface
+func (rl *RLClientImpl) GetAction(sessionID string, state *prog.ActionState) (*prog.Action, error) {
+	// Convert prog.ActionState to local ActionState
+	localState := &ActionState{
+		SessionID:    state.SessionID,
+		CallSequence: state.CallSequence,
+		CallCount:    state.CallCount,
+		ExecTime:     state.ExecTime,
+		ErrorCount:   state.ErrorCount,
+	}
+
+	action, err := GetAction(rl.client, rl.mutex, sessionID, localState)
+	if err != nil {
+		return nil, err
+	}
+
+	// Convert from local Action to prog.Action
+	return &prog.Action{
+		SessionID:   action.SessionID,
+		ActionType:  prog.ActionType(action.ActionType),
+		ActionParam: action.ActionParam,
+	}, nil
+}
+
+// SubmitReward implements the reward submission interface
+func (rl *RLClientImpl) SubmitReward(sessionID string, reward float64) error {
+	return SubmitReward(rl.client, rl.mutex, sessionID, reward)
+}
+
+// ChangeSessionID implements the prog.RLClient interface
+func (rl *RLClientImpl) ChangeSessionID(oldSessionID, newSessionID string) error {
+	return ChangeSessionID(rl.client, rl.mutex, oldSessionID, newSessionID)
+}
+
 func (mgr *Manager) initRL() {
 	mgr.rlClient = jsonrpc.NewClient("http://localhost:5000")
 	log.Logf(0, "RL client initialized")
+
+	// Create RL client implementation and set it globally
+	rlClientImpl := &RLClientImpl{
+		client: &mgr.rlClient,
+		mutex:  &mgr.rlClientMux,
+	}
+	prog.SetRLClient(rlClientImpl)
+	log.Logf(0, "RL client set globally for prog package")
 }
 
 func modesDescription() string {

@@ -83,6 +83,34 @@ class LRUSessionManager:
         """检查session是否存在"""
         return session_id in self.sessions
     
+    def change_session_id(self, old_session_id: str, new_session_id: str) -> bool:
+        """将旧session的数据复制到新session ID，旧session由LRU自然清理"""
+        # 检查旧session是否存在
+        if old_session_id not in self.sessions:
+            self.logger.info(f"Change session ID ignored: old session {old_session_id} does not exist")
+            return False
+        
+        # 检查新session ID是否已存在
+        if new_session_id in self.sessions:
+            self.logger.info(f"Change session ID ignored: new session {new_session_id} already exists")
+            return False
+        
+        # 获取旧session数据
+        old_session = self.sessions[old_session_id]
+        
+        # 创建新session并复制数据
+        new_session = RL_Session(new_session_id)
+        new_session.start_time = old_session.start_time  # 保持原始开始时间
+        new_session.last_active = old_session.last_active  # 保持活跃时间
+        new_session.access_count = old_session.access_count  # 保持访问计数
+        new_session.status = old_session.status  # 保持状态
+        
+        # 插入新session（会自动处理容量限制）
+        self.sessions[new_session_id] = new_session
+        
+        self.logger.info(f"Session ID changed: {old_session_id} -> {new_session_id}, old session will be cleaned by LRU")
+        return True
+    
     def get_stats(self) -> Dict:
         """获取统计信息"""
         return {
@@ -181,15 +209,15 @@ def get_action(session_id: str, state: Dict) -> Result:
     if x<0.10:
           action = {"session_id": session_id, "action_type": 0, "action_param": 0}
     elif x<0.20:
-            action = {"session_id": session_id, "action_type": 0, "action_param": 1}
-    elif x<0.30:
-            action = {"session_id": session_id, "action_type": 0, "action_param": 2}
-    elif x<0.40:
-            action = {"session_id": session_id, "action_type": 1, "action_param": 0}
-    elif x<0.50:
             action = {"session_id": session_id, "action_type": 1, "action_param": 1}
+    elif x<0.30:
+            action = {"session_id": session_id, "action_type": 2, "action_param": 2}
+    elif x<0.40:
+            action = {"session_id": session_id, "action_type": 3, "action_param": 0}
+    elif x<0.50:
+            action = {"session_id": session_id, "action_type": 4, "action_param": 1}
     else:   
-            action = {"session_id": session_id, "action_type": -1, "action_param": 2}
+            action = {"session_id": session_id, "action_type": 5, "action_param": 2}
     
     
     # session activity 已经在get_session中更新了
@@ -222,6 +250,35 @@ def submit_reward(session_id: str, reward: float) -> Result:
         "message": f"Reward {reward} submitted successfully",
         "session_id": session_id
     })
+
+
+@method
+def change_session_id(old_session_id: str, new_session_id: str) -> Result:
+    """Change session ID by copying old session data to new ID"""
+    global session_manager
+    
+    if not old_session_id or not new_session_id:
+        logger.warning("Empty session ID(s) provided for change_session_id")
+        return Error(-32602, "Invalid params: both old_session_id and new_session_id are required")
+    
+    success = session_manager.change_session_id(old_session_id, new_session_id)
+    
+    if success:
+        logger.info(f"Session ID changed successfully: {old_session_id} -> {new_session_id}")
+        return Success({
+            "success": True,
+            "message": f"Session ID changed from {old_session_id} to {new_session_id}",
+            "old_session_id": old_session_id,
+            "new_session_id": new_session_id
+        })
+    else:
+        logger.info(f"Session ID change ignored: {old_session_id} -> {new_session_id}")
+        return Success({
+            "success": False,
+            "message": "Session ID change ignored (session not found or target exists)",
+            "old_session_id": old_session_id,
+            "new_session_id": new_session_id
+        })
 
 
 @method
@@ -264,7 +321,7 @@ if __name__ == "__main__":
             logger.info(f"{self.address_string()} - {format % args}")
     
     logger.info(f"Starting RL JSON-RPC Server on {args.host}:{args.port}")
-    logger.info("Available methods: ping, init_session, end_session")
+    logger.info("Available methods: ping, init_session, get_action, submit_reward, change_session_id, get_session_stats")
     
     try:
         server = HTTPServer((args.host, args.port), RequestHandler)

@@ -232,7 +232,7 @@ func (rl *RLClientImpl) ChangeSessionID(oldSessionID, newSessionID string) error
 }
 
 func (mgr *Manager) initRL() {
-	mgr.rlClient = jsonrpc.NewClient("http://localhost:5000")
+	mgr.rlClient = jsonrpc.NewClient(mgr.cfg.RLServer)
 	log.Logf(0, "RL client initialized")
 
 	// Create RL client implementation and set it globally
@@ -242,6 +242,14 @@ func (mgr *Manager) initRL() {
 	}
 	prog.SetRLClient(rlClientImpl)
 	log.Logf(0, "RL client set globally for prog package")
+	log.Logf(0, "mgr.cfg.RLServer: %s", mgr.cfg.RLServer)
+	//尝试去ping一下rpc是否工作正常
+	err := Ping(&mgr.rlClient, &mgr.mu)
+	if err != nil {
+		log.Logf(0, "RL client ping failed: %v", err)
+	} else {
+		log.Logf(0, "RL client ping succeeded")
+	}
 }
 
 func modesDescription() string {

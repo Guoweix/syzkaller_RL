@@ -6,6 +6,7 @@ package prog
 import (
 	"encoding/binary"
 	"fmt"
+	"log"
 	"math"
 	"math/rand"
 	"sort"
@@ -94,11 +95,11 @@ func applyRLAction(ctx *mutator, action *Action) bool {
 
 	switch action.ActionType {
 	case ActionMutate:
-		return ctx.mutateArg()
+		return ctx.mutateArgWithID(action.ActionParam)
 	case ActionInsert:
-		return ctx.insertCall()
+		return ctx.insertCallWithID(action.ActionParam)
 	case ActionDelete:
-		return ctx.removeCall()
+		return ctx.removeCallWithID(action.ActionParam)
 	case ActionMerge:
 		return ctx.splice()
 	case ActionNormalize:
@@ -173,9 +174,9 @@ func (p *Prog) MutateWithOpts(rs rand.Source, ncalls int, ct *ChoiceTable, noMut
 
 			state := buildActionState(p, 0, 0)
 			rlAction, err := globalRLClient.GetAction(sessionID, state)
-
+			fmt.Println("CallCount:", state.CallCount)
 			if err == nil && rlAction != nil {
-				fmt.Println("RL_Action ", rlAction.ActionType)
+				fmt.Println("RL_Action ", rlAction.ActionType, " ", rlAction.ActionParam)
 				// 根据RL action执行对应的变异操作
 				ok = applyRLAction(ctx, rlAction)
 				if ok {
@@ -325,6 +326,44 @@ func (ctx *mutator) insertCall() bool {
 	return true
 }
 
+func (ctx *mutator) insertCallWithID(idx int) bool {
+	p, r := ctx.p, ctx.r
+	if len(p.Calls) >= ctx.ncalls {
+		return false
+	}
+	// idx := r.biasedRand(len(p.Calls)+1, 5)
+	if idx < 0 || idx > len(p.Calls) {
+		log.Println("removeCallWithID: invalid call index ", idx)
+		return false
+	}
+
+	var c *Call
+	if idx < len(p.Calls) {
+		c = p.Calls[idx]
+	}
+	s := analyze(ctx.ct, ctx.corpus, p, c)
+	calls := r.generateCall(s, p, idx)
+	p.insertBefore(c, calls)
+	for len(p.Calls) > ctx.ncalls {
+		p.RemoveCall(idx)
+	}
+	return true
+}
+
+// Removes a random call from program.
+func (ctx *mutator) removeCallWithID(idx int) bool {
+	p := ctx.p
+	if len(p.Calls) == 0 {
+		return false
+	}
+	if idx < 0 || idx >= len(p.Calls) {
+		log.Println("removeCallWithID: invalid call index ", idx)
+		return false
+	}
+	p.RemoveCall(idx)
+	return true
+}
+
 // Removes a random call from program.
 func (ctx *mutator) removeCall() bool {
 	p, r := ctx.p, ctx.r
@@ -344,6 +383,69 @@ func (ctx *mutator) mutateArg() bool {
 	}
 
 	idx := chooseCall(p, r)
+	if idx < 0 {
+		return false
+	}
+	c := p.Calls[idx]
+	if c.Meta.Attrs.KFuzzTest {
+		tmp := r.genKFuzzTest
+		r.genKFuzzTest = true
+		defer func() {
+			r.genKFuzzTest = tmp
+		}()
+	}
+	if ctx.noMutate[c.Meta.ID] {
+		return false
+	}
+	updateSizes := true
+	for stop, ok := false, false; !stop; stop = ok && r.oneOf(ctx.opts.MutateArgCount) {
+		ok = true
+		ma := &mutationArgs{target: p.Target, ignoreLengths: c.Meta.Attrs.KFuzzTest}
+		ForeachArg(c, ma.collectArg)
+		if len(ma.args) == 0 {
+			return false
+		}
+		s := analyze(ctx.ct, ctx.corpus, p, c)
+		arg, argCtx := ma.chooseArg(r.Rand)
+		calls, ok1 := p.Target.mutateArg(r, s, arg, argCtx, &updateSizes)
+		if !ok1 {
+			ok = false
+			continue
+		}
+		moreCalls, fieldsPatched := r.patchConditionalFields(c, s)
+		calls = append(calls, moreCalls...)
+		p.insertBefore(c, calls)
+		idx += len(calls)
+		for len(p.Calls) > ctx.ncalls {
+			idx--
+			p.RemoveCall(idx)
+		}
+		if idx < 0 || idx >= len(p.Calls) || p.Calls[idx] != c {
+			panic(fmt.Sprintf("wrong call index: idx=%v calls=%v p.Calls=%v ncalls=%v",
+				idx, len(calls), len(p.Calls), ctx.ncalls))
+		}
+		if updateSizes || fieldsPatched {
+			p.Target.assignSizesCall(c)
+		}
+	}
+	return true
+}
+
+// Mutate an argument of a random call.
+func (ctx *mutator) mutateArgWithID(idx int) bool {
+	p, r := ctx.p, ctx.r
+	if len(p.Calls) == 0 {
+		return false
+	}
+
+	if idx < 0 || idx >= len(p.Calls) {
+		log.Println("mutateArgWithID: invalid call index ", idx)
+	}
+
+	if idx >= len(p.Calls) {
+		return false
+	}
+
 	if idx < 0 {
 		return false
 	}

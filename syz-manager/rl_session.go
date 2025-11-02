@@ -14,12 +14,11 @@ import (
 type ActionType int
 
 const (
-	ActionMutate    ActionType = 0 // 变异
+	ActionMutate    ActionType = 0 // 变异参数
 	ActionMerge     ActionType = 1 // 合并
 	ActionInsert    ActionType = 2 // 插入
 	ActionDelete    ActionType = 3 // 删除
 	ActionNormalize ActionType = 4 // 参数规整
-	Error           ActionType = 5 // 错误
 )
 
 type Action struct {

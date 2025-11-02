@@ -450,7 +450,7 @@ func TestSharedClientConcurrency(t *testing.T) {
 				return
 			}
 
-			if action.ActionType < -1 || action.ActionType > Error {
+			if action.ActionType < -1 || action.ActionType > ActionNormalize {
 				errors <- fmt.Errorf("session %d got invalid action type: %d", sessionIndex, action.ActionType)
 				return
 			}

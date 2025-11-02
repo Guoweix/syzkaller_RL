@@ -1,11 +1,12 @@
-
 import logging
 import asyncio
 from datetime import datetime
 from typing import Dict, Optional
-from jsonrpcserver import method, serve, Result, Success, Error
+from jsonrpcserver import method, Result, Success, Error
 import random
 from collections import OrderedDict
+import numpy as np
+from a3c_model import get_trainer
 
 class RL_Session:
     """Class representing a Reinforcement Learning session"""
@@ -16,6 +17,9 @@ class RL_Session:
         self.last_active = self.start_time
         self.access_count = 0  # 访问计数
         self.status = "active"
+        self.last_action = None  # 存储最后一个动作，用于奖励回传
+        self.last_action_step = 0
+        self.last_param = None
         
         # Setup logging
         self.logger = logging.getLogger(f"RL_Session_{session_id}")
@@ -25,12 +29,17 @@ class RL_Session:
         """Update the last active timestamp and increment access count"""
         self.last_active = datetime.now()
         self.access_count += 1
-        self.logger.info(f"Session {self.session_id} activity updated. Access count: {self.access_count}")
+        # 只在访问计数是10的倍数时记录日志，减少噪音
+        if self.access_count % 10 == 0:
+            self.logger.info(f"Session {self.session_id} activity updated. Access count: {self.access_count}")
     
     def end_session(self):
         """End the session"""
         self.status = "ended"
-        self.logger.info(f"Session {self.session_id} ended.")
+        # 通知 A3C 训练器结束会话
+        trainer = get_trainer()
+        trainer.end_session(self.session_id)
+        # self.logger.info(f"Session {self.session_id} ended.")
 
 
 class LRUSessionManager:
@@ -92,7 +101,7 @@ class LRUSessionManager:
         
         # 检查新session ID是否已存在
         if new_session_id in self.sessions:
-            self.logger.info(f"Change session ID ignored: new session {new_session_id} already exists")
+            # self.logger.info(f"Change session ID ignored: new session {new_session_id} already exists")
             return False
         
         # 获取旧session数据
@@ -104,9 +113,15 @@ class LRUSessionManager:
         new_session.last_active = old_session.last_active  # 保持活跃时间
         new_session.access_count = old_session.access_count  # 保持访问计数
         new_session.status = old_session.status  # 保持状态
+        new_session.last_action = old_session.last_action  # 保持最后动作
+        new_session.last_action_step = old_session.last_action_step
+        new_session.last_param = old_session.last_param
         
         # 插入新session（会自动处理容量限制）
         self.sessions[new_session_id] = new_session
+        
+        # 结束旧session
+        old_session.end_session()
         
         self.logger.info(f"Session ID changed: {old_session_id} -> {new_session_id}, old session will be cleaned by LRU")
         return True
@@ -122,7 +137,7 @@ class LRUSessionManager:
 
 
 # Global session manager with LRU capability
-session_manager = LRUSessionManager(max_capacity=1000)  # 最大1000个session
+session_manager = LRUSessionManager(max_capacity=4000)  # 最大1000个session
 
 # Setup logging
 logging.basicConfig(
@@ -172,7 +187,7 @@ def init_session(session_id: str) -> Result:
 
 @method
 def get_action(session_id: str, state: Dict) -> Result:
-    """Get action from the RL agent based on the current state"""
+    """Get action from the A3C agent based on the current state"""
     global session_manager
     
     if not session_id:
@@ -183,7 +198,7 @@ def get_action(session_id: str, state: Dict) -> Result:
     session = session_manager.get_session(session_id)
     if session is None:
         session = session_manager.add_session(session_id)
-        logger.info(f"Auto-created session {session_id}")
+        # logger.info(f"Auto-created session {session_id}")
     
     # 将Go客户端传来的state转换成Python可用的结构体
     try:
@@ -196,36 +211,70 @@ def get_action(session_id: str, state: Dict) -> Result:
             'error_count': state.get('error_count', 0)
         }
         
-        logger.info(f"Received state: session_id={action_state['session_id'][:8]}..., "
-                   f"calls={action_state['call_sequence']}, "
-                   f"exec_time={action_state['exec_time']}ms, "
-                   f"errors={action_state['error_count']}")
+        # 减少状态日志输出频率 - 只记录调试级别
+        logger.debug(f"Received state: session_id={action_state['session_id'][:8]}..., "
+                    f"calls={len(action_state['call_sequence'])} syscalls, "
+                    f"exec_time={action_state['exec_time']}ms, "
+                    f"errors={action_state['error_count']}")
         
     except Exception as e:
         logger.error(f"Failed to parse state: {e}")
         return Error(-32602, f"Invalid state format: {e}")
     
-    # 基于转换后的状态生成动作
+    # 使用 A3C 模型生成动作
+    try:
+        trainer = get_trainer()
+        action_type, param_probs_dict = trainer.get_action(session_id, action_state)
 
-    # action = {"session_id": session_id, "action_type": 0, "action_param": 1}
-    x=random.random()
+        # 计算动作参数
+        action_param = 0
+        if action_type == 0:
+            probs0 = param_probs_dict.get("type0", [])
+            action_param = int(np.argmax(np.asarray(probs0, dtype=np.float32))) if probs0 else 0
+        elif action_type == 2:
+            probs2 = param_probs_dict.get("type2", [])
+            action_param = int(np.argmax(np.asarray(probs2, dtype=np.float32))) if probs2 else 0
+        elif action_type == 3:
+            probs3 = param_probs_dict.get("type3", [])
+            action_param = int(np.argmax(np.asarray(probs3, dtype=np.float32))) if probs3 else 0
+        else:
+            action_param = action_type % 3
 
-    if x<0.10:
-          action = {"session_id": session_id, "action_type": 0, "action_param": 0}
-    elif x<0.20:
+        # 构造动作
+        action = {
+            "session_id": session_id,
+            "action_type": action_type,
+            "action_param": action_param
+        }
+        
+        # 存储动作信息，用于后续的奖励回传
+        session.last_action = action_type
+        session.last_param = action_param
+        session.last_action_step = action_state['call_count']
+        
+        # 减少动作日志输出频率 - 只记录调试级别
+        logger.debug(f"A3C Action provided for session {session_id}: type={action_type}, param={action_param}")
+        
+    except Exception as e:
+        logger.error(f"Error generating action with A3C: {e}")
+        # fallback to random action
+        x = random.random()
+        if x < 0.20:
+            action = {"session_id": session_id, "action_type": 0, "action_param": 0}
+        elif x < 0.40:
             action = {"session_id": session_id, "action_type": 1, "action_param": 1}
-    elif x<0.30:
+        elif x < 0.60:
             action = {"session_id": session_id, "action_type": 2, "action_param": 2}
-    elif x<0.40:
+        elif x < 0.80:
             action = {"session_id": session_id, "action_type": 3, "action_param": 0}
-    elif x<0.50:
+        else:
             action = {"session_id": session_id, "action_type": 4, "action_param": 1}
-    else:   
-        action = {"session_id": session_id, "action_type": 5, "action_param": 0}  # Error
+        
+        session.last_action = action["action_type"]
+        session.last_param = action["action_param"]
+        session.last_action_step = action_state['call_count']
+        logger.debug(f"Fallback random action provided for session {session_id}")
     
-    
-    # session activity 已经在get_session中更新了
-    logger.info(f"Action provided for session {session_id}")
     return Success({
         "action": action,
         "session_id": session_id
@@ -234,7 +283,7 @@ def get_action(session_id: str, state: Dict) -> Result:
 
 @method
 def submit_reward(session_id: str, reward: float) -> Result:
-    """Submit reward to the RL agent"""
+    """Submit reward to the A3C agent"""
     global session_manager
     
     if not session_id:
@@ -243,16 +292,35 @@ def submit_reward(session_id: str, reward: float) -> Result:
     
     session = session_manager.get_session(session_id)
     if session is None:
-        logger.warning(f"Session {session_id} does not exist")
+        # logger.warning(f"Session {session_id} does not exist")
         return Error(-32603, f"Session {session_id} does not exist")
     
-    # Placeholder for reward processing logic
-    logger.info(f"Reward {reward} submitted for session {session_id}")
+    # 使用 A3C 训练器处理奖励
+    try:
+        trainer = get_trainer()
+        loss = None
+        
+        if session.last_action is not None:
+            action_param = session.last_param if session.last_param is not None else 0
+            loss = trainer.submit_reward(session_id, reward, session.last_action, action_param)
+            logger.info(
+                f"Reward {reward} submitted for session {session_id}, action {session.last_action}, param {action_param}"
+            )
+            
+            if loss is not None:
+                logger.info(f"A3C model updated, loss: {loss:.6f}")
+        else:
+            logger.warning(f"No previous action found for session {session_id}")
+            
+    except Exception as e:
+        logger.error(f"Error submitting reward to A3C: {e}")
+        return Error(-32603, f"Error processing reward: {e}")
     
     return Success({
         "success": True,
         "message": f"Reward {reward} submitted successfully",
-        "session_id": session_id
+        "session_id": session_id,
+        "loss": loss
     })
 
 
@@ -268,7 +336,7 @@ def change_session_id(old_session_id: str, new_session_id: str) -> Result:
     success = session_manager.change_session_id(old_session_id, new_session_id)
     
     if success:
-        logger.info(f"Session ID changed successfully: {old_session_id} -> {new_session_id}")
+        # logger.info(f"Session ID changed successfully: {old_session_id} -> {new_session_id}")
         return Success({
             "success": True,
             "message": f"Session ID changed from {old_session_id} to {new_session_id}",
@@ -294,7 +362,87 @@ def get_session_stats() -> Result:
     logger.info(f"Session stats requested: {stats}")
     return Success(stats)
 
-    
+
+@method
+def get_training_stats() -> Result:
+    """Get A3C training statistics"""
+    try:
+        trainer = get_trainer()
+        training_stats = trainer.get_stats()
+        logger.info(f"Training stats requested: {training_stats}")
+        return Success(training_stats)
+    except Exception as e:
+        logger.error(f"Error getting training stats: {e}")
+        return Error(-32603, f"Error getting training stats: {e}")
+
+
+@method
+def save_model(model_path: str = None) -> Result:
+    """Save the current A3C model"""
+    try:
+        trainer = get_trainer()
+        if model_path is None:
+            model_path = f"a3c_model_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pth"
+        
+        trainer.save_model(model_path)
+        logger.info(f"Model saved to {model_path}")
+        return Success({
+            "success": True,
+            "message": f"Model saved to {model_path}",
+            "model_path": model_path
+        })
+    except Exception as e:
+        logger.error(f"Error saving model: {e}")
+        return Error(-32603, f"Error saving model: {e}")
+
+
+@method
+def load_model(model_path: str) -> Result:
+    """Load an A3C model"""
+    try:
+        trainer = get_trainer()
+        trainer.load_model(model_path)
+        logger.info(f"Model loaded from {model_path}")
+        return Success({
+            "success": True,
+            "message": f"Model loaded from {model_path}",
+            "model_path": model_path
+        })
+    except Exception as e:
+        logger.error(f"Error loading model: {e}")
+        return Error(-32603, f"Error loading model: {e}")
+
+ 
+@method
+def get_exploration_params() -> Result:
+    """Get current exploration parameters (epsilon, temperature, action counts)"""
+    try:
+        trainer = get_trainer()
+        agent = trainer.agent
+        
+        exploration_info = {
+            "current_epsilon": agent._current_epsilon(),
+            "current_temperature": agent._current_temperature(), 
+            "total_action_calls": agent.total_action_calls,
+            "epsilon_config": {
+                "start": agent.epsilon_start,
+                "end": agent.epsilon_end, 
+                "decay_steps": agent.epsilon_decay_steps
+            },
+            "temperature_config": {
+                "start": agent.temp_start,
+                "end": agent.temp_end,
+                "decay_steps": agent.temp_decay_steps
+            }
+        }
+        
+        logger.info(f"Exploration params requested: epsilon={exploration_info['current_epsilon']:.4f}, temp={exploration_info['current_temperature']:.4f}")
+        return Success(exploration_info)
+    except Exception as e:
+        logger.error(f"Error getting exploration params: {e}")
+        return Error(-32603, f"Error getting exploration params: {e}")
+
+
 
 if __name__ == "__main__":
     import argparse
@@ -303,11 +451,35 @@ if __name__ == "__main__":
     from http.server import BaseHTTPRequestHandler
     import json
     
-    parser = argparse.ArgumentParser(description="RL JSON-RPC Server")
-    parser.add_argument("--host", default="localhost", help="Server host")
+    parser = argparse.ArgumentParser(description="RL JSON-RPC Server with A3C")
+    parser.add_argument("--host", default="0.0.0.0", help="Server host")
     parser.add_argument("--port", type=int, default=5000, help="Server port")
+    parser.add_argument("--load-model", type=str, help="Path to load pre-trained model")
+    parser.add_argument("--temperature", type=float, help="Initial temperature for exploration (overrides model default)")
     
     args = parser.parse_args()
+    
+    # 初始化 A3C 训练器
+    logger.info("Initializing A3C trainer...")
+    trainer = get_trainer()
+    
+    # 如果指定了模型路径，则加载模型
+    if args.load_model:
+        try:
+            trainer.load_model(args.load_model)
+            logger.info(f"Pre-trained model loaded from {args.load_model}")
+        except Exception as e:
+            logger.error(f"Failed to load model: {e}")
+    
+    # 如果指定了温度参数，则设置初始温度
+    if args.temperature is not None:
+        try:
+            trainer.agent.temp_start = args.temperature
+            trainer.agent.temp_end = args.temperature  # 固定温度，不衰减
+            trainer.agent.temp_decay_steps = 1  # 立即生效
+            logger.info(f"Temperature set to {args.temperature}")
+        except Exception as e:
+            logger.error(f"Failed to set temperature: {e}")
     
     class RequestHandler(BaseHTTPRequestHandler):
         def do_POST(self):
@@ -322,10 +494,21 @@ if __name__ == "__main__":
             self.wfile.write(response.encode())
         
         def log_message(self, format, *args):
-            logger.info(f"{self.address_string()} - {format % args}")
+            # 屏蔽 HTTP 请求日志
+            pass
     
-    logger.info(f"Starting RL JSON-RPC Server on {args.host}:{args.port}")
-    logger.info("Available methods: ping, init_session, get_action, submit_reward, change_session_id, get_session_stats")
+    logger.info(f"Starting RL JSON-RPC Server with A3C on {args.host}:{args.port}")
+    logger.info("Available methods: ping, init_session, get_action, submit_reward, change_session_id, get_session_stats, get_training_stats, save_model, load_model, get_exploration_params")
+    
+    # 显示当前探索参数配置
+    if args.temperature is not None:
+        logger.info(f"Temperature override set to: {args.temperature}")
+    try:
+        current_epsilon = trainer.agent._current_epsilon()
+        current_temp = trainer.agent._current_temperature()
+        logger.info(f"Current exploration params - Epsilon: {current_epsilon:.4f}, Temperature: {current_temp:.4f}")
+    except Exception as e:
+        logger.debug(f"Could not display exploration params: {e}")
     
     try:
         server = HTTPServer((args.host, args.port), RequestHandler)
@@ -333,4 +516,11 @@ if __name__ == "__main__":
         server.serve_forever()
     except KeyboardInterrupt:
         logger.info("Server stopped by user")
+        # 保存模型
+        try:
+            final_model_path = f"a3c_model_final_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pth"
+            trainer.save_model(final_model_path)
+            logger.info(f"Final model saved to {final_model_path}")
+        except Exception as e:
+            logger.error(f"Failed to save final model: {e}")
         server.shutdown()

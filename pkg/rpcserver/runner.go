@@ -458,7 +458,7 @@ func (runner *Runner) handleExecResult(msg *flatrpc.ExecResult) error {
 			sessionID := calculateSessionID(req.Prog)
 			// Use global RL reward submission function
 			if err := prog.SubmitRLReward(sessionID, reward); err != nil {
-				fmt.Printf("F_")
+				// fmt.Printf("F_")
 			} else {
 				fmt.Printf("Submitted RL reward %.2f for session %s\n", reward, sessionID)
 			}
